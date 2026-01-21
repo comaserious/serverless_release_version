@@ -17,6 +17,6 @@ runpod.serverless.start(
     {
         "handler": handler,
         "concurrency_modifier": lambda x: vllm_engine.max_concurrency,
-        "return_aggregate_stream": False,
+        "return_aggregate_stream": True,
     }
 )
