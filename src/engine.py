@@ -112,16 +112,8 @@ class vLLMEngine:
             llm_input = tokenizer_wrapper.apply_chat_template(llm_input)
         results_generator = self.llm.generate(llm_input, validated_sampling_params, request_id)
         n_responses, n_input_tokens, is_first_output = validated_sampling_params.n, 0, True
-        last_output_texts, token_counters = ["" for _ in range(n_responses)], {"batch": 0, "total": 0}
-
-        batch = {
-            "choices": [{"tokens": []} for _ in range(n_responses)],
-        }
-        
-        max_batch_size = batch_size or self.default_batch_size
-        batch_size_growth_factor, min_batch_size = batch_size_growth_factor or self.batch_size_growth_factor, min_batch_size or self.min_batch_size
-        batch_size = BatchSize(max_batch_size, min_batch_size, batch_size_growth_factor)
-    
+        last_output_texts = ["" for _ in range(n_responses)]
+        token_counters = {"total": 0}
 
         async for request_output in results_generator:
             if is_first_output:  # Count input tokens only once
@@ -135,36 +127,34 @@ class vLLMEngine:
                     # Calculate new output (delta from last output)
                     new_output = output.text[len(last_output_texts[output_index]):]
                     
-                    # Only process non-empty outputs
+                    # Only process non-empty outputs - yield immediately (like Ollama)
                     if new_output:
-                        batch["choices"][output_index]["tokens"].append(new_output)
-                        token_counters["batch"] += 1
                         token_counters["total"] += 1
-
-                        if token_counters["batch"] >= batch_size.current_batch_size:
-                            batch["usage"] = {
+                        
+                        # Yield each token immediately without batching
+                        chunk = {
+                            "choices": [{"tokens": []} for _ in range(n_responses)],
+                            "usage": {
                                 "input": n_input_tokens,
                                 "output": token_counters["total"],
                             }
-                            yield batch
-                            batch = {
-                                "choices": [{"tokens": []} for _ in range(n_responses)],
-                            }
-                            token_counters["batch"] = 0
-                            batch_size.update()
+                        }
+                        chunk["choices"][output_index]["tokens"].append(new_output)
+                        yield chunk
                 else:
                     # For non-streaming, just count tokens
                     token_counters["total"] += 1
 
                 last_output_texts[output_index] = output.text
 
+        # For non-streaming mode, yield the final output
         if not stream:
+            batch = {
+                "choices": [{"tokens": []} for _ in range(n_responses)],
+                "usage": {"input": n_input_tokens, "output": token_counters["total"]}
+            }
             for output_index, output in enumerate(last_output_texts):
                 batch["choices"][output_index]["tokens"] = [output]
-            token_counters["batch"] += 1
-
-        if token_counters["batch"] > 0:
-            batch["usage"] = {"input": n_input_tokens, "output": token_counters["total"]}
             yield batch
 
     def _initialize_llm(self):
@@ -286,12 +276,9 @@ class OpenAIvLLMEngine(vLLMEngine):
         if not openai_request.openai_input.get("stream") or isinstance(response_generator, ErrorResponse):
             yield response_generator.model_dump()
         else:
-            batch = []
-            batch_token_counter = 0
-            batch_size = BatchSize(self.default_batch_size, self.min_batch_size, self.batch_size_growth_factor)
-        
+            # Stream mode: yield each chunk immediately (like Ollama)
             async for chunk_str in response_generator:
-                # Skip [DONE] message
+                # Skip [DONE] message - we'll send it at the end
                 if "[DONE]" in chunk_str:
                     continue
                 
@@ -299,35 +286,26 @@ class OpenAIvLLMEngine(vLLMEngine):
                 if not chunk_str or not chunk_str.strip():
                     continue
                     
-                # Process data chunks
+                # Process and yield each chunk immediately
                 if "data:" in chunk_str or "data" in chunk_str:
                     try:
                         if self.raw_openai_output:
-                            data = chunk_str
+                            # For raw output, yield the chunk as-is
+                            yield chunk_str
                         else:
                             # Remove "data: " prefix and parse JSON
                             chunk_data = chunk_str.removeprefix("data:").removeprefix("data: ").strip()
                             if chunk_data:
                                 data = json.loads(chunk_data)
-                            else:
-                                continue
-                        
-                        batch.append(data)
-                        batch_token_counter += 1
-                        
-                        if batch_token_counter >= batch_size.current_batch_size:
-                            if self.raw_openai_output:
-                                batch = "".join(batch)
-                            yield batch
-                            batch = []
-                            batch_token_counter = 0
-                            batch_size.update()
+                                # Yield each chunk immediately
+                                yield data
                     except json.JSONDecodeError as e:
                         logging.warning(f"Failed to parse chunk: {chunk_str}, error: {e}")
                         continue
-                        
-            # Yield any remaining batch data
-            if batch and len(batch) > 0:
-                if self.raw_openai_output:
-                    batch = "".join(batch)
-                yield batch
+            
+            # Send [DONE] message at the end (like Ollama)
+            if self.raw_openai_output:
+                yield "data: [DONE]\n\n"
+            else:
+                yield {"data": "[DONE]"}
+            
