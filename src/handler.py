@@ -7,11 +7,25 @@ vllm_engine = vLLMEngine()
 OpenAIvLLMEngine = OpenAIvLLMEngine(vllm_engine)
 
 async def handler(job):
-    job_input = JobInput(job["input"])
-    engine = OpenAIvLLMEngine if job_input.openai_route else vllm_engine
-    results_generator = engine.generate(job_input)
-    async for batch in results_generator:
-        yield batch
+    """
+    Main handler for RunPod serverless requests.
+    Streams results in batches to optimize HTTP calls while preventing token loss.
+    """
+    try:
+        job_input = JobInput(job["input"])
+        engine = OpenAIvLLMEngine if job_input.openai_route else vllm_engine
+        results_generator = engine.generate(job_input)
+        
+        # Stream all batches from the generator
+        async for batch in results_generator:
+            if batch:  # Only yield non-empty batches
+                yield batch
+                
+    except Exception as e:
+        # Log and yield error response
+        import logging
+        logging.error(f"Error in handler: {e}")
+        yield {"error": str(e)}
 
 runpod.serverless.start(
     {

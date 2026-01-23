@@ -110,51 +110,82 @@ class vLLMEngine:
         if apply_chat_template or isinstance(llm_input, list):
             tokenizer_wrapper = self._get_tokenizer_for_chat_template()
             llm_input = tokenizer_wrapper.apply_chat_template(llm_input)
+        
         results_generator = self.llm.generate(llm_input, validated_sampling_params, request_id)
-        n_responses, n_input_tokens, is_first_output = validated_sampling_params.n, 0, True
+        n_responses = validated_sampling_params.n
+        n_input_tokens = 0
+        is_first_output = True
         last_output_texts = ["" for _ in range(n_responses)]
-        token_counters = {"total": 0}
+        token_counters = {"batch": 0, "total": 0}
 
-        async for request_output in results_generator:
-            if is_first_output:  # Count input tokens only once
-                n_input_tokens = len(request_output.prompt_token_ids)
-                is_first_output = False
+        batch = {
+            "choices": [{"tokens": []} for _ in range(n_responses)],
+        }
+        
+        max_batch_size = batch_size or self.default_batch_size
+        batch_size_growth_factor = batch_size_growth_factor or self.batch_size_growth_factor
+        min_batch_size = min_batch_size or self.min_batch_size
+        batch_size_obj = BatchSize(max_batch_size, min_batch_size, batch_size_growth_factor)
 
-            for output in request_output.outputs:
-                output_index = output.index
-                
-                if stream:
-                    # Calculate new output (delta from last output)
-                    new_output = output.text[len(last_output_texts[output_index]):]
+        try:
+            async for request_output in results_generator:
+                # Count input tokens only once
+                if is_first_output:
+                    n_input_tokens = len(request_output.prompt_token_ids)
+                    is_first_output = False
+
+                for output in request_output.outputs:
+                    output_index = output.index
                     
-                    # Only process non-empty outputs - yield immediately (like Ollama)
-                    if new_output:
-                        token_counters["total"] += 1
+                    # Update last output text first (항상 업데이트)
+                    current_text = output.text
+                    
+                    if stream:
+                        # Calculate new output (delta from last output)
+                        new_output = current_text[len(last_output_texts[output_index]):]
                         
-                        # Yield each token immediately without batching
-                        chunk = {
-                            "choices": [{"tokens": []} for _ in range(n_responses)],
-                            "usage": {
-                                "input": n_input_tokens,
-                                "output": token_counters["total"],
-                            }
-                        }
-                        chunk["choices"][output_index]["tokens"].append(new_output)
-                        yield chunk
-                else:
-                    # For non-streaming, just count tokens
-                    token_counters["total"] += 1
+                        # Only process non-empty outputs
+                        if new_output:
+                            batch["choices"][output_index]["tokens"].append(new_output)
+                            token_counters["batch"] += 1
+                            token_counters["total"] += 1
 
-                last_output_texts[output_index] = output.text
+                            # Yield when batch size is reached
+                            if token_counters["batch"] >= batch_size_obj.current_batch_size:
+                                batch["usage"] = {
+                                    "input": n_input_tokens,
+                                    "output": token_counters["total"],
+                                }
+                                yield batch
+                                batch = {
+                                    "choices": [{"tokens": []} for _ in range(n_responses)],
+                                }
+                                token_counters["batch"] = 0
+                                batch_size_obj.update()
+                    else:
+                        # Non-streaming: just count tokens
+                        token_counters["total"] += 1
+                    
+                    # Update last output text after processing
+                    last_output_texts[output_index] = current_text
 
-        # For non-streaming mode, yield the final output
+        except Exception as e:
+            logging.error(f"Error during vLLM generation: {e}")
+            # Yield any remaining batch before raising error
+            if token_counters["batch"] > 0:
+                batch["usage"] = {"input": n_input_tokens, "output": token_counters["total"]}
+                yield batch
+            raise
+
+        # Handle non-streaming final output
         if not stream:
-            batch = {
-                "choices": [{"tokens": []} for _ in range(n_responses)],
-                "usage": {"input": n_input_tokens, "output": token_counters["total"]}
-            }
-            for output_index, output in enumerate(last_output_texts):
-                batch["choices"][output_index]["tokens"] = [output]
+            for output_index, output_text in enumerate(last_output_texts):
+                batch["choices"][output_index]["tokens"] = [output_text]
+            batch["usage"] = {"input": n_input_tokens, "output": token_counters["total"]}
+            yield batch
+        # Handle streaming final batch (if any remaining)
+        elif token_counters["batch"] > 0:
+            batch["usage"] = {"input": n_input_tokens, "output": token_counters["total"]}
             yield batch
 
     def _initialize_llm(self):
@@ -273,39 +304,76 @@ class OpenAIvLLMEngine(vLLMEngine):
         dummy_request = DummyRequest()
         response_generator = await generator_function(request, raw_request=dummy_request)
 
-        if not openai_request.openai_input.get("stream") or isinstance(response_generator, ErrorResponse):
+        # FIX: ErrorResponse 먼저 체크 (스트리밍 여부와 별개)
+        if isinstance(response_generator, ErrorResponse):
             yield response_generator.model_dump()
-        else:
-            # Stream mode: yield each chunk immediately (like Ollama)
+            return
+            
+        # Non-streaming mode
+        if not openai_request.openai_input.get("stream", False):
+            yield response_generator.model_dump()
+            return
+        
+        # Streaming mode
+        batch = []
+        batch_token_counter = 0
+        batch_size = BatchSize(self.default_batch_size, self.min_batch_size, self.batch_size_growth_factor)
+    
+        try:
             async for chunk_str in response_generator:
-                # Skip [DONE] message - we'll send it at the end
+                # Skip [DONE] message (배치에 추가하기 전에)
                 if "[DONE]" in chunk_str:
                     continue
                 
                 # Skip empty chunks
                 if not chunk_str or not chunk_str.strip():
                     continue
-                    
-                # Process and yield each chunk immediately
-                if "data:" in chunk_str or "data" in chunk_str:
+                
+                # FIX: 더 엄격한 데이터 청크 체크 (startswith 사용)
+                if chunk_str.startswith("data:") or chunk_str.startswith("data "):
                     try:
                         if self.raw_openai_output:
-                            # For raw output, yield the chunk as-is
-                            yield chunk_str
+                            data = chunk_str
                         else:
                             # Remove "data: " prefix and parse JSON
-                            chunk_data = chunk_str.removeprefix("data:").removeprefix("data: ").strip()
-                            if chunk_data:
-                                data = json.loads(chunk_data)
-                                # Yield each chunk immediately
-                                yield data
+                            chunk_data = chunk_str.removeprefix("data:").removeprefix("data: ").removeprefix("data ").strip()
+                            if not chunk_data:
+                                continue
+                            data = json.loads(chunk_data)
+                        
+                        batch.append(data)
+                        batch_token_counter += 1
+                        
+                        # Yield when batch size is reached
+                        if batch_token_counter >= batch_size.current_batch_size:
+                            if self.raw_openai_output:
+                                yield "".join(batch)
+                            else:
+                                yield batch
+                            batch = []
+                            batch_token_counter = 0
+                            batch_size.update()
+                            
                     except json.JSONDecodeError as e:
                         logging.warning(f"Failed to parse chunk: {chunk_str}, error: {e}")
                         continue
-            
-            # Send [DONE] message at the end (like Ollama)
+                    except Exception as e:
+                        logging.error(f"Unexpected error processing chunk: {e}")
+                        continue
+        except Exception as e:
+            logging.error(f"Error during streaming: {e}")
+            # Yield any remaining batch before raising error
+            if batch:
+                if self.raw_openai_output:
+                    yield "".join(batch)
+                else:
+                    yield batch
+            raise
+                    
+        # FIX: 마지막 배치 반드시 yield (스트림 종료 시)
+        if batch:
             if self.raw_openai_output:
-                yield "data: [DONE]\n\n"
+                yield "".join(batch)
             else:
-                yield {"data": "[DONE]"}
+                yield batch
             
